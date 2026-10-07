@@ -1,0 +1,25 @@
+{
+  "name": "syn-stripe-bridge",
+  "version": "1.0.0",
+  "description": "Sovereign Stripe v1 REST API Drop-In Emulator on Solana Token-2022 & ISO 20022 Clearing",
+  "type": "module",
+  "main": "src/stripe_shim.mjs",
+  "scripts": {
+    "start": "node src/stripe_shim.mjs",
+    "test": "node tests/test_stripe_shim.mjs"
+  },
+  "keywords": [
+    "stripe",
+    "solana",
+    "token-2022",
+    "iso20022",
+    "cbpr-plus",
+    "finos",
+    "fdc3",
+    "payment-intent",
+    "ai-agents",
+    "bankerx"
+  ],
+  "author": "Abdul Shabazz <veritasvaultone@gmail.com> (Synaptics Lab)",
+  "license": "Apache-2.0"
+}
