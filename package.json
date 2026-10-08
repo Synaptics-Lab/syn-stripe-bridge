@@ -1,12 +1,14 @@
 {
   "name": "syn-stripe-bridge",
-  "version": "1.0.0",
-  "description": "Sovereign Stripe v1 REST API Drop-In Emulator on Solana Token-2022 & ISO 20022 Clearing",
+  "version": "0.2.0",
+  "description": "Honest-core Stripe v1 REST drop-in emulator settling onto Solana devnet OUSD (Token-2022) with ISO 20022 CBPR+ wire evidence",
   "type": "module",
   "main": "src/stripe_shim.mjs",
   "scripts": {
     "start": "node src/stripe_shim.mjs",
-    "test": "node tests/test_stripe_shim.mjs"
+    "test": "node tests/run-tests.mjs",
+    "smoke": "node scripts/smoke_devnet.mjs",
+    "provision": "node scripts/provision_smoke.mjs"
   },
   "keywords": [
     "stripe",

@@ -1,28 +1,101 @@
 /**
  * FINOS BankerX — 14-Point Structural CBPR+ ISO 20022 Validation Engine
- * Synthesizes and validates pacs.008.001.08 XML wires with RFC 4122 UETR tracking.
+ * Synthesizes and validates pacs.008.001.08 XML wires with RFC 4122 UETR tracking,
+ * and emits pacs.002.001.10 PaymentStatusReports after on-chain delivery evidence.
+ *
+ * v0.2 honesty rules (bridge review F8, 2026-10-08):
+ *   - NO fabricated party defaults. Every required BIC/name is a REQUIRED
+ *     argument; the builder throws loud instead of inventing a bank
+ *     (the old CHASGB2L / KCBKENNAXXX / TZCBETZ2 / 'JPMorgan London Treasury'
+ *     defaults are gone — a wire that names a bank that was never involved is
+ *     a fabrication, not a convenience).
+ *   - The charge (TSA levy) info block appears ONLY when the caller supplies
+ *     BOTH a positive charge amount AND the real charge-agent BIC. Default is
+ *     no ChrgsInf — never a hardcoded agent.
+ *   - pacs.002 is generated only by the settlement core AFTER the delivered-
+ *     delta evidence gate passes, carrying that evidence verbatim.
  */
 
-import { randomUUID } from 'crypto';
+const BIC_RE = /^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/;
+const CURRENCY_RE = /^[A-Z]{3}$/;
+
+function requireField(fields, name, re, label) {
+    const v = fields[name];
+    const s = String(v ?? '').trim();
+    if (!s || (re ? !re.test(s) : false)) {
+        throw new Error(`cbpr_build_refused: ${label} is required${re ? ` and must match ${label}'s format` : ''} — no default is ever used (got ${s ? `length ${s.length}` : 'missing'}, not logged).`);
+    }
+    return s;
+}
 
 export class CBPRPlusValidator {
     /**
-     * Synthesizes an ISO 20022 pacs.008.001.08 Customer Credit Transfer XML Wire.
+     * Synthesizes an ISO 20022 pacs.008.001.08 Customer Credit Transfer XML wire.
+     * All party fields REQUIRED — synthetic defaults removed (F8).
+     *
+     * @param {object} o
+     * @param {string} o.paymentId     pacs.008 MsgId / EndToEndId (<=35 chars).
+     * @param {string} o.uetr          RFC 4122 UUIDv4 SWIFT gpi UETR.
+     * @param {string|number} o.instructedAmount  Decimal amount (major units).
+     * @param {string} o.currency      ISO 4217 (uppercase).
+     * @param {string} o.debtorName    Real debtor (merchant) institution/party name.
+     * @param {string} o.debtorBic     Real debtor agent BIC (ISO 9362).
+     * @param {string} o.creditorName  Real creditor party name.
+     * @param {string} o.creditorBic   Real creditor agent BIC (ISO 9362).
+     * @param {string} [o.chargeBearer='SHAR']  DEBT/CRED/SHAR/SLEV.
+     * @param {number} [o.chargeAmount]          Levy in same currency (major units). Omit for none.
+     * @param {string} [o.chargeAgentBic]        Levy agent BIC. REQUIRED iff chargeAmount > 0.
      */
-    static buildPacs008({
-        paymentId = `BNKX-${Date.now()}`,
-        uetr = randomUUID(),
-        instructedAmount = 5000.00,
-        currency = 'USD',
-        debtorName = 'JPMorgan London Treasury',
-        debtorBic = 'CHASGB2L',
-        creditorName = 'Nairobi Settlement Desk',
-        creditorBic = 'KCBKENNAXXX',
-        chargeBearer = 'SHAR',
-        statutoryTaxAmount = 25.00
-    }) {
+    static buildPacs008(o = {}) {
+        const chargeBearer = String(o.chargeBearer ?? 'SHAR').toUpperCase();
+        if (!['DEBT', 'CRED', 'SHAR', 'SLEV'].includes(chargeBearer)) {
+            throw new Error(`cbpr_build_refused: chargeBearer '${chargeBearer}' is not DEBT/CRED/SHAR/SLEV`);
+        }
+        const paymentId = requireField(o, 'paymentId', null, 'paymentId');
+        if (paymentId.length > 35) {
+            throw new Error(`cbpr_build_refused: paymentId longer than 35 chars (${paymentId.length})`);
+        }
+        const uetr = requireField(o, 'uetr', null, 'uetr');
+        const currency = requireField(o, 'currency', CURRENCY_RE, 'ISO 4217 currency');
+        const debtorName = requireField(o, 'debtorName', null, 'debtorName');
+        const debtorBic = requireField(o, 'debtorBic', BIC_RE, 'debtorBic (ISO 9362 BIC)');
+        const creditorName = requireField(o, 'creditorName', null, 'creditorName');
+        const creditorBic = requireField(o, 'creditorBic', BIC_RE, 'creditorBic (ISO 9362 BIC)');
+
+        const amount = Number(o.instructedAmount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            throw new Error(`cbpr_build_refused: instructedAmount must be a positive number (got ${o.instructedAmount})`);
+        }
+
+        // Charge info only with BOTH a >0 amount and a real agent BIC — and a
+        // charge carrier whose BIC is missing is a refused build, never a
+        // defaulted one.
+        let chargesInf = '';
+        const chargeAmount = Number(o.chargeAmount ?? 0);
+        if (Number.isFinite(chargeAmount) && chargeAmount > 0) {
+            const chargeAgentBic = String(o.chargeAgentBic ?? '').trim();
+            if (!BIC_RE.test(chargeAgentBic)) {
+                throw new Error('cbpr_build_refused: chargeAmount > 0 requires the real chargeAgentBic (ISO 9362) — the levy agent is never defaulted');
+            }
+            if (chargeAmount >= amount) {
+                throw new Error(`cbpr_build_refused: chargeAmount ${chargeAmount} >= instructedAmount ${amount}`);
+            }
+            chargesInf = `      <ChrgsInf>
+        <Amt Ccy="${currency}">${chargeAmount.toFixed(2)}</Amt>
+        <Agt>
+          <FinInstnId>
+            <BICFI>${chargeAgentBic}</BICFI>
+          </FinInstnId>
+        </Agt>
+        <Tp>
+          <Prtry>TSA_STATUTORY_WITHHOLDING</Prtry>
+        </Tp>
+      </ChrgsInf>
+`;
+        }
+
         const creationDateTime = new Date().toISOString();
-        
+
         const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08">
   <FIToFICstmrCdtTrf>
@@ -39,20 +112,9 @@ export class CBPRPlusValidator {
         <EndToEndId>${paymentId}</EndToEndId>
         <UETR>${uetr}</UETR>
       </PmtId>
-      <IntrBkSttlmAmt Ccy="${currency}">${instructedAmount.toFixed(2)}</IntrBkSttlmAmt>
+      <IntrBkSttlmAmt Ccy="${currency}">${amount.toFixed(2)}</IntrBkSttlmAmt>
       <ChrgBr>${chargeBearer}</ChrgBr>
-      <ChrgsInf>
-        <Amt Ccy="${currency}">${statutoryTaxAmount.toFixed(2)}</Amt>
-        <Agt>
-          <FinInstnId>
-            <BICFI>TZCBETZ2</BICFI>
-          </FinInstnId>
-        </Agt>
-        <Tp>
-          <Prtry>TSA_STATUTORY_WITHHOLDING</Prtry>
-        </Tp>
-      </ChrgsInf>
-      <Dbtr>
+${chargesInf}      <Dbtr>
         <Nm>${debtorName}</Nm>
       </Dbtr>
       <DbtrAgt>
@@ -76,7 +138,86 @@ export class CBPRPlusValidator {
     }
 
     /**
+     * Synthesizes an ISO 20022 pacs.002.001.10 PaymentStatusReport — generated
+     * ONLY after the settlement core's delivered-delta evidence gate passed.
+     * Carries the on-chain evidence (signature, slot) verbatim.
+     */
+    static buildPacs002(o = {}) {
+        const {
+            originalMsgId,
+            uetr,
+            instructedAmount,
+            currency,
+            debtorBic,
+            creditorBic,
+            status = 'Acsc',
+            railSignature,
+            railSlot
+        } = o;
+        const required = {
+            originalMsgId: v => { const s = String(v ?? '').trim(); return s && s.length <= 35; },
+            uetr: v => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(v ?? '')),
+            instructedAmount: v => Number(v) > 0 && Number.isFinite(Number(v)),
+            currency: v => CURRENCY_RE.test(String(v ?? '').toUpperCase()),
+            debtorBic: v => BIC_RE.test(String(v ?? '')),
+            creditorBic: v => BIC_RE.test(String(v ?? ''))
+        };
+        const refusals = [];
+        for (const [name, ok] of Object.entries(required)) {
+            if (!ok(o[name])) refusals.push(name);
+        }
+        if (refusals.length) {
+            throw new Error(`cbpr_pacs002_refused: required fields missing/invalid: ${refusals.join(', ')}`);
+        }
+        if (status !== 'Acsc' && !railSignature) {
+            throw new Error('cbpr_pacs002_refused: a non-Acsc status needs a reason — v0.2 emits pacs.002 ONLY on delivery evidence (Acsc)');
+        }
+
+        const reportId = `${originalMsgId}R`.slice(0, 35);
+        const creationDateTime = new Date().toISOString();
+        const railEvidence = railSignature ? `
+      <StsRsnInf>
+        <AddtlInf>RAIL_SIGNATURE:${railSignature}${railSlot ? `|SLOT:${railSlot}` : ''}</AddtlInf>
+      </StsRsnInf>` : '';
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.002.001.10">
+  <FIToFIPmtStsRpt>
+    <GrpHdr>
+      <MsgId>${reportId}</MsgId>
+      <CreDtTm>${creationDateTime}</CreDtTm>
+      <NbOfTxs>1</NbOfTxs>
+      <SttlmInf>
+        <SttlmMtd>CLRG</SttlmMtd>
+      </SttlmInf>
+    </GrpHdr>
+    <TxInfAndSts>
+      <StsId>${status}</StsId>
+      <OrgnlEndToEndId>${originalMsgId}</OrgnlEndToEndId>
+      <OrgnlUETR>${uetr}</OrgnlUETR>
+      <OrgnlIntrBkSttlmAmt Ccy="${currency.toUpperCase()}">${Number(instructedAmount).toFixed(2)}</OrgnlIntrBkSttlmAmt>
+      <PmtSts>
+        <TxSts>${status}</TxSts>
+      </PmtSts>
+      <DbtrAgt>
+        <FinInstnId>
+          <BICFI>${debtorBic}</BICFI>
+        </FinInstnId>
+      </DbtrAgt>
+      <CdtrAgt>
+        <FinInstnId>
+          <BICFI>${creditorBic}</BICFI>
+        </FinInstnId>
+      </CdtrAgt>${railEvidence}
+    </TxInfAndSts>
+  </FIToFIPmtStsRpt>
+</Document>`;
+
+        return { xml, status: 'Acsc', originalMsgId, uetr };
+    }
+
+    /**
      * Executes the strict 14-Point Structural CBPR+ Validation.
+     * @returns {{valid: boolean, score: string, checks: Array<{rule,name,passed}>}}
      */
     static validate(xmlString) {
         const results = [];
