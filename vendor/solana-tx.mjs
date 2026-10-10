@@ -549,8 +549,109 @@ export async function sendAndConfirmSolanaTx(base64Tx, { timeoutMs = 60_000, con
   return { signature: sig, deliveredByAccount, slot: tx.slot, blockTime: tx.blockTime };
 }
 
+// ---------------- custodian spend cap (ported 2026-10-10) ----------------
+// Port of reserveCustodianSpend from mcp/interledger-escrow-server/solana-tx.mjs
+// (the 2026-10-08 hardening, 8c0c5d8). Added here so the vendored estate stack
+// carries the cap on every payout path it serves — the vendored copy previously
+// had no cap at all. ADDITIVE only: no existing export changed. Coverage mirrors
+// the source exactly (the cap guards the PAYOUT path, reserve-before-sign);
+// direct signSolanaTx/sendAndConfirmSolanaTx callers (e.g. the operator's
+// send_deposit.mjs funding tool) stay uncapped by design, as upstream.
+//
+// State: shared with the escrow server by default (same file, same row shape,
+// same O_EXCL ledger-lock protocol inlined so this file stays
+// single-deployable) — two processes serving the same custody key must count
+// against ONE per-era counter, or each binary doubles the other's headroom.
+// Set SOLANA_CUSTODIAN_SPEND_FILE to re-point (tests re-point per run).
+//
+// The default custodian key file is auto-capped by realpath; other key paths
+// are operator-managed and exempt (upstream rule). Env is re-read per call so
+// tests can re-point the key file after module load, like spendFile().
+function defaultCustodianPath() {
+  return process.env.SOLANA_CUSTODIAN_KEY_FILE || "/root/.synaptic/vault/solana-custodian.json";
+}
+function spendFile() { return process.env.SOLANA_CUSTODIAN_SPEND_FILE || "/opt/synapticchain/mcp/solana-custodian-spend.json"; }
+
+// Measured basis (upstream, 2026-10-08, devnet getSignaturesForAddress + tx
+// meta deltas): 56 custodian txs/24h, 10-tx sample = 7 value sends totalling
+// ~166,000,000 lamports. Default cap = 3× that measured day.
+export const DEFAULT_SPEND_CAP = 500_000_000;
+const RECEIPT_MAX = 50;
+
+function sleepMsSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+
+/**
+ * Reserve `lamports` against the era cap for the default custodian. Throws
+ * `custodian_spend_cap_exceeded: ...` (fail-closed) when the reservation
+ * would exceed the cap. Returns the receipt row { era, spent_lamports,
+ * cap_lamports, reserved_lamports, pubkey }, or null when the key is exempt.
+ */
+export function reserveCustodianSpend({ custodianPath, lamports, pubkey }) {
+  let capped = !custodianPath; // no explicit path ⇒ the default custodian
+  if (!capped) {
+    // A missing key file cannot be the default custodian; loadKeypair
+    // refuses it right after with its own error, so treat it as exempt.
+    try {
+      capped = fs.realpathSync(custodianPath) === fs.realpathSync(defaultCustodianPath());
+    } catch { capped = false; }
+  }
+  if (!capped) return null; // non-default key files are operator-managed
+  if (!Number.isSafeInteger(lamports) || lamports <= 0) throw new Error("lamports must be a positive safe integer");
+  const capLamports = Number(process.env.SOLANA_CUSTODIAN_MAX_SPEND_ERA) || DEFAULT_SPEND_CAP;
+  const era = process.env.SOLANA_CUSTODIAN_ERA // optional forced era bump (e.g. after a key rotation)
+    || new Date().toISOString().slice(0, 10); // default era = UTC calendar day
+  const lockPath = `${spendFile()}.lock`;
+  const deadline = Date.now() + 15_000;
+  let fd = -1;
+  for (;;) {
+    try { fd = fs.openSync(lockPath, "wx"); break; } // O_EXCL — the actual lock
+    catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > 30_000) {
+          try { fs.unlinkSync(lockPath); } catch { /* someone else broke it */ }
+          continue;
+        }
+      } catch { continue; } // lock vanished between EEXIST and stat
+      if (Date.now() > deadline) throw new Error(`ledger_lock_timeout: ${lockPath} held too long`);
+      sleepMsSync(25);
+    }
+  }
+  try {
+    const read = (() => { try { return JSON.parse(fs.readFileSync(spendFile(), "utf8")); } catch { return null; } })();
+    const cur = (read && read.era === era) ? read
+      : { era, spent_lamports: 0, receipts: [] }; // new era resets the counter
+    if (cur.spent_lamports + lamports > capLamports) {
+      throw new Error(
+        `custodian_spend_cap_exceeded: era ${era} spent ${cur.spent_lamports} + wanted ${lamports} > cap ${capLamports}`
+        + ` (SOLANA_CUSTODIAN_MAX_SPEND_ERA; refuse BEFORE any signature)`);
+    }
+    cur.spent_lamports += lamports;
+    const tmp = `${spendFile()}.${process.pid}.${Date.now()}.tmp`;
+    const wfd = fs.openSync(tmp, "w");
+    try {
+      fs.writeSync(wfd, JSON.stringify({ era, spent_lamports: cur.spent_lamports,
+        cap_lamports: capLamports, pubkey: pubkey || null,
+        receipts: (cur.receipts ?? []).slice(-(RECEIPT_MAX - 1)).concat(
+          { lamports, ts: new Date().toISOString() }) }, null, 2));
+      fs.fsyncSync(wfd);
+    } finally { fs.closeSync(wfd); }
+    fs.renameSync(tmp, spendFile());
+    fs.chmodSync(spendFile(), 0o600);
+    return { era, spent_lamports: cur.spent_lamports, cap_lamports: capLamports, reserved_lamports: lamports, pubkey: pubkey || null };
+  } finally {
+    try { fd >= 0 && fs.closeSync(fd); } catch { /* fd already closed */ }
+    try { fs.unlinkSync(lockPath); } catch { /* already broken */ }
+  }
+}
+
 /** One-shot custodian payout: System transfer + SPL Memo v2 in the same tx. */
 export async function solanaPayout({ custodianPath, toPubkey, lamports, memo, extraSigners = [] }) {
+  // Cap guard FIRST — a cap refusal must never cost a signature or an RPC
+  // round-trip, and the reserve-before-send ordering means two concurrent
+  // payout paths cannot both fit inside the same headroom. (Upstream parity:
+  // same guard, same order, same refusal.)
+  const reserved = reserveCustodianSpend({ custodianPath, lamports });
   const custodian = loadKeypair(custodianPath);
   if (!b58decode(toPubkey) || b58decode(toPubkey).length !== 32) throw new Error("bad destination pubkey");
   if (!Number.isSafeInteger(lamports) || lamports <= 0) throw new Error("lamports must be a positive safe integer");

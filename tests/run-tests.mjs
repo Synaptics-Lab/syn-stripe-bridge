@@ -6,3 +6,4 @@
 process.env.SOLANA_RPC_URL = `http://127.0.0.1:${process.env.MOCK_PORT || "18231"}`;
 await import("./mock-solana-rpc.mjs");
 await import("./test_stripe_shim.mjs");
+await import("./test_custodian_cap.mjs");
