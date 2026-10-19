@@ -199,16 +199,26 @@ const TAG_VALIDATORS = {
   // parity); decimals are the u8 wire decimals transfer_checked enforces.
   'A': (seg) => seg.length === 3 && ASSET_RE.test(seg[0]) && isMint(seg[1])
         && isDecimalField(seg[2]) && Number(seg[2]) <= 255,
+  // D (uniform-desk grammar, operator ruling 2026-10-09): rail-exchange desk
+  // (:8425) deposit intent — the payer's memo on the INCOMING rail payment.
+  // intent = full UUIDv4; dest = the L1 syn1 address that receives the payout.
+  'D':  (seg) => seg.length === 2 && UUID_V4_RE.test(seg[0]) && SYN_ADDR_RE.test(seg[1]),
+  // DR: the desk's OUTGOING native-SYN payout marker on synaptic-l1 — binds
+  // the desk payout tx back to the deposit intent it settles.
+  'DR': (seg) => seg.length === 1 && UUID_V4_RE.test(seg[0]),
 };
 
 // W: decimal window-or-session (no leading zeros, R16 numeric session ids fit) + syn address.
 TAG_VALIDATORS['W'] = (seg) => seg.length === 2 && isDecimalField(seg[0]) && SYN_ADDR_RE.test(seg[1]);
 
 // ---------------------------------------------------------------------------
-// Registry: the 12 canonical discriminators (integration-map §2) + the legacy
+// Registry: the canonical discriminators (integration-map §2) + the legacy
 // bare `X402:<corridor>[:<uetr>[:ATS:<root>]]` carrier still LIVE_GATEWAY in the
 // estate, + the desk pacs.008 carrier (X402P) admitted by the F-19 SSOT
-// convergence (UTA-2026-10-03-001). Statuses are the canonical estate statuses
+// convergence (UTA-2026-10-03-001), + the uniform desk grammar (X402D/X402DR,
+// operator ruling 2026-10-09 — the rail-exchange desk's ad-hoc XSYN:/XSYNP:
+// dialect retired in favor of the SSOT, and StartPayment (:8313) already
+// validates this family). Statuses are the canonical estate statuses
 // from the integration map.
 // ---------------------------------------------------------------------------
 const DISCRIMINATOR_REGISTRY = {
@@ -301,6 +311,18 @@ const DISCRIMINATOR_REGISTRY = {
     service: 'x402-tswp asset registry (SEP-0001) / ptb-controller (:8416) / synaptic-fx-terminal',
     rails: ['solana-devnet', 'synaptic-l1'],
     description: 'issuer-agnostic asset binding — binds the settlement asset symbol to its on-chain token mint identifier + wire decimals so the memo witnesses WHICH instrument moved; inaugural registration: OUSD (Open Standard, mainnet Token-2022 mint ousd2mJsPEckLHcSCDxyKD7NDGARZcfLbDZkKiatYHB, decimals 6, RPC-verified 2026-10-07). External issuance on mainnet — devnet executors honestly refuse OUSD-class legs rather than fake a settlement',
+  },
+  'D': {
+    syntax: 'X402D:<intent>:<dest_syn>', tag: 'D', status: 'LIVE_GATEWAY',
+    service: 'rail-exchange desk (:8425) / nodes-api',
+    rails: ['solana-devnet', 'xrpl-altnet'],
+    description: 'desk deposit intent — the payer memo on an INCOMING rail payment; intent is a full UUIDv4, dest is the synaptic-l1 address the desk must pay out to (replaces the ad-hoc XSYN: dialect; uniform with StartPayment/x402-tswp per operator ruling 2026-10-09)',
+  },
+  'DR': {
+    syntax: 'X402DR:<intent>', tag: 'DR', status: 'STANDARDS_TRACK',
+    service: 'rail-exchange desk (:8425) payout legs',
+    rails: ['xrpl-altnet'],
+    description: 'desk payout receipt — the desk payout tx carries this marker to bind it to the X402D deposit intent it settles (replaces the ad-hoc XSYNP: dialect per operator ruling 2026-10-09). Rails that accept memos (XRPL payouts) carry it on-wire; native-SYN payouts on synaptic-l1 have no transfer memo field on the frozen stack, so their binding of record is the desk intent ledger row (out.tx)',
   },
 };
 
@@ -456,5 +478,17 @@ export const buildAssetBindingMemo = (asset, mint, decimals) =>
     (() => { const m = String(mint); if (b58Decode32(m) === null) throw new Error('tswp_build_failed_not_base58_pubkey:mint'); return m; })(),
     (() => { const s = String(decimals); if (!isDecimalField(s) || Number(s) > 255) throw new Error('tswp_build_failed_not_wire_decimals:decimals'); return s; })(),
   ]);
+
+// Uniform desk grammar (X402D/X402DR, operator ruling 2026-10-09): the
+// rail-exchange desk's ONLY sanctioned memo emission path on BOTH directions
+// of its flow. buildDeskDepositMemo(intent, dest) = the payer's memo on the
+// rail deposit (intent = full UUIDv4, dest = bech32m syn1 payout address);
+// buildDeskPayoutMemo(intent) = the desk's marker on its native-SYN payout tx.
+export const buildDeskDepositMemo = (intent, dest) =>
+  build('D', [
+    uuidOr(intent, 'intent'),
+    (() => { const s = String(dest); if (!SYN_ADDR_RE.test(s)) throw new Error('tswp_build_failed_not_syn1_address:dest'); return s; })(),
+  ]);
+export const buildDeskPayoutMemo = (intent) => build('DR', [uuidOr(intent, 'intent')]);
 
 export { DISCRIMINATOR_REGISTRY };
